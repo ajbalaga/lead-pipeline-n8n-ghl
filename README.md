@@ -127,13 +127,106 @@ which maps the event and calls back into the app:
 ```
 sent to `POST /api/leads/status` with header `x-internal-token: {INTERNAL_API_TOKEN}`.
 
-## Running it locally first
+## Deploying it
 
-Before touching a VPS, the whole loop (app → n8n → GHL → n8n → app) can be
-proven out on a laptop with just Docker Desktop and Node installed. This is
-the actual sequence used to validate this project, gotchas included — worth
-following before deploying, since it's much cheaper to hit these problems
-locally than on a production box.
+This project targets **DigitalOcean** for the VPS and **GoDaddy** for the
+domain — pick whichever provider you like instead, the steps below are the
+same shape on any Ubuntu droplet and any registrar with DNS management.
+
+### 1. Provision the VPS on DigitalOcean
+
+1. Sign in at [digitalocean.com](https://digitalocean.com) → **Create →
+   Droplets**.
+2. Image: **Ubuntu 24.04 (LTS) x64**.
+3. Plan: **Basic**, Regular SSD, the $12/mo tier (2 GB RAM / 1 vCPU) —
+   1 GB is tight once Postgres + n8n + the app are all running concurrently.
+4. Region: pick whatever's closest to your actual users (e.g. Singapore for
+   Southeast Asia).
+5. Authentication: **SSH Key** (add your public key here rather than a
+   password — simpler and safer than hardening password auth after the
+   fact).
+6. Create the droplet and note its public IPv4 address from the dashboard.
+
+### 2. Point a domain at it via GoDaddy
+
+1. If you don't already own a domain, buy a cheap one at
+   [godaddy.com](https://godaddy.com) (Domains → search → purchase, roughly
+   $12–20/yr for a `.com`) — Caddy's automatic HTTPS and GHL's webhook
+   delivery both need a real domain, not a bare IP.
+2. In GoDaddy: **My Products → your domain → DNS → Manage DNS**.
+3. Add two **A records** pointing at the droplet's IP:
+   - Type `A`, Name `app`, Value `<droplet IP>`, TTL default (1 hour is fine)
+   - Type `A`, Name `n8n`, Value `<droplet IP>`, TTL default
+4. If GoDaddy's default parking page left an `A` record on `@`, leave it
+   alone (or repoint it too, if you want the bare domain to resolve) — it
+   doesn't conflict with the `app`/`n8n` subdomains.
+5. DNS propagation is usually fast but can take up to an hour; check with
+   `nslookup app.yourdomain.com` before assuming it's broken.
+
+### 3. Harden the droplet
+
+1. SSH in as root, create a non-root sudo user, set up UFW
+   (`ufw allow 22,80,443/tcp`), and disable root/password SSH login.
+2. Install Docker + the Compose plugin
+   (`curl -fsSL https://get.docker.com | sh`, then
+   `sudo apt install docker-compose-plugin`).
+
+### 4. Deploy the stack
+
+```bash
+git clone <your-repo-url> brightfix && cd brightfix
+cp .env.example .env
+# edit .env: set POSTGRES_PASSWORD, INTERNAL_API_TOKEN, APP_DOMAIN, N8N_DOMAIN,
+# and N8N_WEBHOOK_URL (https://n8n.yourdomain.com/webhook/lead-intake)
+docker compose up -d --build
+```
+
+First load of `https://n8n.yourdomain.com` shows n8n's owner-account setup
+screen (self-hosted n8n now uses its own user management rather than basic
+auth) — create your login there.
+
+### 5. Set up GHL
+
+1. Start a free GHL trial, create a sub-account ("location").
+2. Settings → Private Integrations → create a token scoped to
+   `contacts.write` and `contacts.readonly`. This is simpler than a full
+   OAuth app for a single-account internal tool like this one — OAuth is for
+   apps installed on accounts you don't own.
+3. Build one real GHL Workflow: trigger = "Tag added" (`new-lead-plumbing`,
+   etc.), actions = send a welcome SMS/email, wait, then an internal
+   notification. Add a final "Webhook" action pointing at
+   `https://n8n.yourdomain.com/webhook/ghl-status-callback` so GHL can report
+   status changes back.
+
+### 6. Import and wire the n8n workflows
+
+1. In n8n: Settings → Import Workflow → `n8n/lead-intake-workflow.json`.
+   Add an HTTP Header Auth credential (`Authorization: Bearer
+   <your GHL Private Integration Token>`) and set `GHL_LOCATION_ID` as an
+   n8n environment variable. Activate the workflow.
+2. Import `n8n/ghl-callback-workflow.json`. Set `APP_STATUS_WEBHOOK_URL`
+   (`https://app.yourdomain.com/api/leads/status`) and reuse
+   `INTERNAL_API_TOKEN` from `.env` as an n8n environment variable. Activate.
+
+### 7. Run the MCP server (optional, local)
+
+```bash
+cd mcp-server
+npm install && npm run build
+# tunnel to the VPS's Postgres rather than exposing 5432 publicly:
+ssh -L 5433:localhost:5432 you@your-vps-ip
+DATABASE_URL=postgres://leaduser:<password>@localhost:5433/leads npm start
+```
+Then add it to Claude Code/Desktop's MCP config pointing at
+`node mcp-server/dist/index.js` with that `DATABASE_URL`.
+
+## Developing locally (optional)
+
+The VPS steps above are the real deployment target, but the whole loop
+(app → n8n → GHL → n8n → app) can also be run entirely on a laptop with just
+Docker Desktop and Node installed — useful for iterating on the app or
+workflows without touching the droplet. This is the actual sequence used
+while developing this project, gotchas included.
 
 ### 1. Postgres
 
@@ -277,76 +370,9 @@ SMS/email and calls the "Webhook" action back to n8n) lives entirely in
 GHL's cloud, which can't reach `http://localhost:5678`. To test that specific
 leg without deploying, tunnel it — `ngrok http 5678` and point the GHL
 Workflow's Webhook action at the ngrok URL — or just deploy to the VPS
-(below) and point it at the real domain. Everything else in the architecture
+(above) and point it at the real domain. Everything else in the architecture
 diagram (app, Postgres, both n8n workflows, the real GHL contacts API) is
 fully exercised by the steps above.
-
-## Deploying it
-
-### 1. Provision the VPS
-
-1. Create a droplet/instance — DigitalOcean or Vultr, Singapore region if
-   you're latency-sensitive, Ubuntu 24.04 LTS, 2 GB RAM (1 GB is tight once
-   Postgres + n8n + the app are all running). Add your SSH key at creation.
-2. Point DNS: two A records at the VPS's IP — one for the app
-   (`app.yourdomain.com`) and one for n8n (`n8n.yourdomain.com`). If you
-   don't have a domain yet, buy a cheap one (Namecheap/Porkbun, ~$10–12/yr)
-   — Caddy's automatic HTTPS and GHL's webhook delivery both need a real
-   domain, not a bare IP.
-3. SSH in as root, create a non-root sudo user, set up UFW
-   (`ufw allow 22,80,443/tcp`), and disable root/password SSH login.
-4. Install Docker + the Compose plugin
-   (`curl -fsSL https://get.docker.com | sh`, then
-   `sudo apt install docker-compose-plugin`).
-
-### 2. Deploy the stack
-
-```bash
-git clone <your-repo-url> brightfix && cd brightfix
-cp .env.example .env
-# edit .env: set POSTGRES_PASSWORD, INTERNAL_API_TOKEN, APP_DOMAIN, N8N_DOMAIN,
-# and N8N_WEBHOOK_URL (https://n8n.yourdomain.com/webhook/lead-intake)
-docker compose up -d --build
-```
-
-First load of `https://n8n.yourdomain.com` shows n8n's owner-account setup
-screen (self-hosted n8n now uses its own user management rather than basic
-auth) — create your login there.
-
-### 3. Set up GHL
-
-1. Start a free GHL trial, create a sub-account ("location").
-2. Settings → Private Integrations → create a token scoped to
-   `contacts.write` and `contacts.readonly`. This is simpler than a full
-   OAuth app for a single-account internal tool like this one — OAuth is for
-   apps installed on accounts you don't own.
-3. Build one real GHL Workflow: trigger = "Tag added" (`new-lead-plumbing`,
-   etc.), actions = send a welcome SMS/email, wait, then an internal
-   notification. Add a final "Webhook" action pointing at
-   `https://n8n.yourdomain.com/webhook/ghl-status-callback` so GHL can report
-   status changes back.
-
-### 4. Import and wire the n8n workflows
-
-1. In n8n: Settings → Import Workflow → `n8n/lead-intake-workflow.json`.
-   Add an HTTP Header Auth credential (`Authorization: Bearer
-   <your GHL Private Integration Token>`) and set `GHL_LOCATION_ID` as an
-   n8n environment variable. Activate the workflow.
-2. Import `n8n/ghl-callback-workflow.json`. Set `APP_STATUS_WEBHOOK_URL`
-   (`https://app.yourdomain.com/api/leads/status`) and reuse
-   `INTERNAL_API_TOKEN` from `.env` as an n8n environment variable. Activate.
-
-### 5. Run the MCP server (optional, local)
-
-```bash
-cd mcp-server
-npm install && npm run build
-# tunnel to the VPS's Postgres rather than exposing 5432 publicly:
-ssh -L 5433:localhost:5432 you@your-vps-ip
-DATABASE_URL=postgres://leaduser:<password>@localhost:5433/leads npm start
-```
-Then add it to Claude Code/Desktop's MCP config pointing at
-`node mcp-server/dist/index.js` with that `DATABASE_URL`.
 
 ## How this was built
 
