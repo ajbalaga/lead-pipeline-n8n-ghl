@@ -127,6 +127,160 @@ which maps the event and calls back into the app:
 ```
 sent to `POST /api/leads/status` with header `x-internal-token: {INTERNAL_API_TOKEN}`.
 
+## Running it locally first
+
+Before touching a VPS, the whole loop (app → n8n → GHL → n8n → app) can be
+proven out on a laptop with just Docker Desktop and Node installed. This is
+the actual sequence used to validate this project, gotchas included — worth
+following before deploying, since it's much cheaper to hit these problems
+locally than on a production box.
+
+### 1. Postgres
+
+```bash
+docker run -d --name brightfix-pg \
+  -e POSTGRES_USER=leaduser -e POSTGRES_PASSWORD=devpass -e POSTGRES_DB=leads \
+  -p 5434:5432 \
+  postgres:16-alpine
+docker exec -i brightfix-pg psql -U leaduser -d leads < db/init.sql
+```
+
+**Gotcha:** don't assume port 5432 (or even 5433) is free. A machine that's
+ever had PostgreSQL installed natively — via the Windows installer, Homebrew,
+`apt`, a Postgres.app, etc. — is often already listening there, and Docker's
+`-p 5432:5432` mapping can silently lose that fight (Docker itself reports
+success; connections just get routed to the wrong server, producing a
+confusing "password authentication failed" error even with the right
+password for the *container's* user). Confirm with `netstat -ano | grep 5432`
+(Windows) / `lsof -i :5432` (macOS/Linux) before assuming the container is
+what's answering, and pick a clearly-unused port (5434 here) if anything else
+is already bound.
+
+**Gotcha (Windows/Git Bash only):** mounting `db/init.sql` via `-v` from Git
+Bash gets its path silently mangled by MSYS path conversion (the container
+ends up with a mount destination like `\Program Files\Git\docker-entrypoint-
+initdb.d\...`, so the script never runs and the `leads` table is never
+created). Piping the schema in directly with `docker exec -i ... psql < db/init.sql`
+(as above) sidesteps it entirely.
+
+### 2. The app
+
+```bash
+npm install
+```
+
+Create `.env.local` (already gitignored — never commit this):
+```
+DATABASE_URL=postgres://leaduser:devpass@localhost:5434/leads
+N8N_WEBHOOK_URL=http://localhost:5678/webhook/lead-intake
+INTERNAL_API_TOKEN=devtoken123
+```
+
+```bash
+npm run dev
+```
+
+`N8N_WEBHOOK_URL` is read as optional by `/api/leads` — leaving it unset
+still lets leads save to Postgres, useful for testing the form in isolation
+before n8n is wired up.
+
+### 3. n8n
+
+```bash
+docker volume create brightfix-n8n-data
+docker run -d --name brightfix-n8n \
+  -e N8N_HOST=localhost -e N8N_PROTOCOL=http \
+  -e WEBHOOK_URL=http://localhost:5678/ \
+  -e GENERIC_TIMEZONE=Asia/Manila \
+  -e APP_STATUS_WEBHOOK_URL=http://host.docker.internal:3000/api/leads/status \
+  -e INTERNAL_API_TOKEN=devtoken123 \
+  -e GHL_LOCATION_ID=<your GHL location id> \
+  -e N8N_BLOCK_ENV_ACCESS_IN_NODE=false \
+  -v brightfix-n8n-data:/home/node/.n8n \
+  -p 5678:5678 \
+  n8nio/n8n:latest
+```
+
+Two things worth calling out:
+
+- **Always mount a volume** (`/home/node/.n8n`) from the first run. Without
+  one, the owner account, imported workflows, and credentials all live only
+  in the container's writable layer — recreating the container (e.g. to add
+  an env var) wipes all of it, and you redo onboarding from scratch.
+- **`N8N_BLOCK_ENV_ACCESS_IN_NODE=false` is required.** Recent n8n versions
+  block workflow expressions from reading `$env` by default as a security
+  hardening measure. Both workflows here reference `$env.GHL_LOCATION_ID`,
+  `$env.APP_STATUS_WEBHOOK_URL`, and `$env.INTERNAL_API_TOKEN` — without this
+  flag, the "Upsert GHL Contact" node fails with `access to env vars denied`.
+  It's safe to disable for a single-tenant local/VPS instance you control;
+  leave it enabled (the default) on a shared or multi-tenant n8n instance.
+- Since the app runs on the host (`npm run dev`) and n8n runs in Docker, the
+  callback workflow reaches the app via Docker's `host.docker.internal`
+  hostname, not `localhost`.
+
+Open `http://localhost:5678` and walk through first-run setup:
+
+| | |
+|---|---|
+| ![n8n owner account setup](docs/screenshots/n8n-owner-setup.png) | **Create the owner account.** First-run screen — any email/password works for local testing. |
+| ![n8n AI Assistant onboarding](docs/screenshots/n8n-ai-assistant-onboarding.png) | **Skip via "Set up later in Settings."** Not needed to run these two workflows. |
+| ![n8n free license key offer](docs/screenshots/n8n-license-key-offer.png) | **Safe to skip.** Advanced debugging/search/folders aren't needed for a two-workflow test. |
+| ![n8n customize survey](docs/screenshots/n8n-customize-survey.png) | **Cosmetic only** — answer anything, it doesn't affect functionality. |
+
+### 4. Import and wire the workflows
+
+Import both `n8n/lead-intake-workflow.json` and `n8n/ghl-callback-workflow.json`
+(new workflow → **⋯** → **Import from File**). If both land on the same
+canvas because you imported the second one into the still-open first
+workflow instead of a fresh blank one, that's harmless — n8n activates every
+trigger node in a workflow independently, so both webhook paths
+(`/webhook/lead-intake` and `/webhook/ghl-status-callback`) still register
+correctly either way.
+
+Get GHL credentials for the "Upsert GHL Contact" node: in your GHL
+sub-account, **Settings → Private Integrations** → create one scoped to
+`contacts.write` + `contacts.readonly`, copy the token, and create an
+**HTTP Header Auth** credential in n8n with header `Authorization` = `Bearer
+<token>`. The Location ID comes from the sub-account's settings URL
+(`/location/<LOCATION_ID>/...`).
+
+| | |
+|---|---|
+| ![Missing credential warning](docs/screenshots/n8n-credential-warning.png) | **The warning triangle** on "Upsert GHL Contact" means the HTTP Header Auth credential isn't wired up yet — click the node → **Connect to Header Auth** → **Create New** to fix it. |
+
+Click **Publish** (or **Activate**) once the warning clears.
+
+### 5. Fire a test lead end to end
+
+```bash
+curl -X POST http://localhost:3000/api/leads \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Jamie Rivera","email":"jamie@example.com","phone":"555-019-2044","service":"plumbing","message":"Kitchen sink is leaking under the cabinet."}'
+```
+
+| | |
+|---|---|
+| ![Lead form, empty](docs/screenshots/lead-form-empty.png) | The form a visitor sees. |
+| ![Lead form, submitted](docs/screenshots/lead-form-submitted.png) | Confirmation state after a successful `POST /api/leads` — the lead is now in Postgres and the n8n webhook has fired. |
+| ![n8n execution — lead intake succeeded](docs/screenshots/n8n-execution-lead-intake.png) | In n8n's **Executions** tab: the Lead Webhook branch ran green — Postgres → n8n → GHL contact upsert all succeeded. |
+| ![n8n execution — GHL callback succeeded](docs/screenshots/n8n-execution-ghl-callback.png) | Simulating GHL's status-change webhook (`curl .../webhook/ghl-status-callback`) exercises the other branch — n8n → app → Postgres status update. |
+
+Confirm in Postgres directly if you want to see the full round trip:
+```bash
+docker exec brightfix-pg psql -U leaduser -d leads -c "select name, email, status from leads;"
+```
+
+### What local testing doesn't cover
+
+GHL's own tag-triggered Workflow (the piece that fires the welcome
+SMS/email and calls the "Webhook" action back to n8n) lives entirely in
+GHL's cloud, which can't reach `http://localhost:5678`. To test that specific
+leg without deploying, tunnel it — `ngrok http 5678` and point the GHL
+Workflow's Webhook action at the ngrok URL — or just deploy to the VPS
+(below) and point it at the real domain. Everything else in the architecture
+diagram (app, Postgres, both n8n workflows, the real GHL contacts API) is
+fully exercised by the steps above.
+
 ## Deploying it
 
 ### 1. Provision the VPS
