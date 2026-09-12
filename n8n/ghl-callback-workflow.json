@@ -1,0 +1,75 @@
+{
+  "name": "GHL Status Callback -> App",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ghl-status-callback",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "ghl-webhook-node",
+      "name": "GHL Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "ghl-status-callback"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.item.json.body ?? $input.item.json;\nconst email = (body.email || body.contact?.email || '').toLowerCase().trim();\nconst statusMap = { 'booked-call': 'booked', 'contacted': 'contacted', 'lost': 'lost' };\nconst tag = (body.tags || [])[0] || body.tag;\nreturn { json: { email, status: statusMap[tag] || 'contacted' } };"
+      },
+      "id": "map-status-node",
+      "name": "Map GHL Event to Status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.APP_STATUS_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-internal-token", "value": "={{ $env.INTERNAL_API_TOKEN }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"email\": $json.email, \"status\": $json.status } }}",
+        "options": {}
+      },
+      "id": "update-app-node",
+      "name": "Update Lead Status in App",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"ok\": true } }}"
+      },
+      "id": "respond-ghl-node",
+      "name": "Respond to GHL",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [900, 300]
+    }
+  ],
+  "connections": {
+    "GHL Webhook": {
+      "main": [[{ "node": "Map GHL Event to Status", "type": "main", "index": 0 }]]
+    },
+    "Map GHL Event to Status": {
+      "main": [[{ "node": "Update Lead Status in App", "type": "main", "index": 0 }]]
+    },
+    "Update Lead Status in App": {
+      "main": [[{ "node": "Respond to GHL", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" }
+}
